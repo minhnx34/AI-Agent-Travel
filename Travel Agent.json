@@ -1,0 +1,1119 @@
+{
+  "name": "Travel Agent",
+  "nodes": [
+    {
+      "parameters": {
+        "options": {}
+      },
+      "id": "915baebf-3da9-47f6-a3b1-6fdd4283ea0a",
+      "name": "Chat Trigger",
+      "type": "@n8n/n8n-nodes-langchain.chatTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        720,
+        416
+      ],
+      "webhookId": "travel-agency-chat-mvp"
+    },
+    {
+      "parameters": {
+        "jsCode": "const sid = String($('Chat Trigger').first().json.sessionId || '');\nconst store = $getWorkflowStaticData('global');\nconst blob = store.states && store.states[sid] ? store.states[sid] : '';\nreturn [{json:{state_blob: blob}}];"
+      },
+      "id": "768bc5b6-718d-4731-ad0a-eaf60b10e0e4",
+      "name": "Load chat state",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1136,
+        608
+      ],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Pure business logic shared by n8n Code nodes and regression tests.\n// All supplier data are synthetic. No external booking or money movement.\nconst clone = x => JSON.parse(JSON.stringify(x));\nconst iso = d => new Date(d).toISOString().slice(0,10);\nconst allowedPatch = ['origin','destination','start_date','end_date','adults','budget_total','currency','contact','hotel_stars','pace','interests','guide_language','must_have','avoid'];\nconst required = ['origin','destination','start_date','end_date','adults','budget_total','currency','contact'];\nconst interview = ['hotel_stars','pace','interests','guide_language'];\nconst events = ['request','approve','travellers','ack_documents','start_trip','end_trip','feedback','incident','resolve_incident','resolve_claim','question'];\nconst labels = {origin:'город отправления',destination:'направление',start_date:'дата начала YYYY-MM-DD',end_date:'дата окончания YYYY-MM-DD',adults:'число взрослых',budget_total:'общий бюджет на всю группу',currency:'валюта',contact:'контакт',hotel_stars:'категория отеля: 3 или 5',pace:'темп: relaxed или standard',interests:'интересы: museums и/или architecture',guide_language:'язык гида: ru или en'};\nfunction initial(id, now) { return {session_id:id,request_id:'REQ-'+id,status:'NEW',brief:{},revision:0,proposal_version:0,proposals:[],incidents:[],claims:[],audit:[],created_at:now,clarification_rounds:0}; }\nfunction context(input, old, now='2026-10-09T09:00:00.000Z') {\n  const e=clone(input), s=old?clone(old):initial(e.session_id,now);\n  return {e,s,now,halt:false,planning:false,trace:[],response:{},http_status:200};\n}\nfunction say(c,status,message,extra={}) {c.s.status=status;c.response={status,message,...extra};}\nfunction stop(c,status,message,extra={}) {say(c,status,message,extra);c.halt=true;return c;}\nfunction reject(c,message){c.http_status=400;c.response={status:'INVALID_EVENT',message,current_status:c.s.status};c.halt=true;return c;}\nfunction trace(c,stage,action){c.trace.push({stage,action});}\nfunction ask(c,status,message,extra={}) {\n  c.s.clarification_rounds++;\n  if(c.s.clarification_rounds>3) return stop(c,'MANAGER_REVIEW','Более трёх циклов уточнения. Требуется менеджер.',{reason:message,...extra});\n  return stop(c,status,message,extra);\n}\nfunction validDate(x){return typeof x==='string'&&/^\\d{4}-\\d{2}-\\d{2}$/.test(x)&&Number.isFinite(Date.parse(x))&&iso(x)===x;}\nfunction days(b){return Math.round((Date.parse(b.end_date)-Date.parse(b.start_date))/86400000)+1;}\nfunction quote(b,stars=b.hotel_stars){\n  const nights=days(b)-1,rooms=Math.ceil(b.adults/2);\n  const lines=[{id:'transport',unit:4000,quantity:b.adults,unit_basis:'round trip / adult'},\n    {id:'hotel',unit:stars===5?15000:4000,quantity:nights*rooms,unit_basis:'room-night'},\n    {id:'activities',unit:1200,quantity:b.adults*2,unit_basis:'visit / adult'},\n    {id:'transfers',unit:1000,quantity:2,unit_basis:'group transfer'},\n    {id:'guide',unit:3000,quantity:1,unit_basis:'group session'}];\n  lines.forEach(x=>x.total=x.unit*x.quantity);\n  const cost=lines.reduce((a,x)=>a+x.total,0),reserve=Math.round(cost*.05),markup=Math.round(cost*.15);\n  return {mock:true,currency:'RUB',lines,cost,reserve,markup,total:cost+reserve+markup,estimated_profit:markup,margin_pct:100*markup/(cost+reserve+markup),rules:'reserve 5% of cost; markup 15% of cost; demo prices include supplier charges; no tax model'};\n}\nfunction validatePatch(p) {\n  if(!p||typeof p!=='object'||Array.isArray(p))return 'patch phải là object';\n  for(const [k,v] of Object.entries(p)){\n    if(!allowedPatch.includes(k))return 'Unsupported field: '+k;\n    if(v===null)continue; // Explicit null clears a previously known field.\n    if(['adults','budget_total','hotel_stars'].includes(k)){if(typeof v!=='number'||!Number.isFinite(v))return 'Expected number: '+k;}\n    else if(['interests','must_have','avoid'].includes(k)){if(!Array.isArray(v)||v.some(x=>typeof x!=='string'))return 'Expected string array: '+k;}\n    else if(typeof v!=='string')return 'Expected string: '+k;\n  }return null;\n}\nfunction sg1(c){\n  if(c.halt)return c;\n  trace(c,'SG1','register / merge explicit update');\n  const {e,s}=c;\n  if(!events.includes(e.event))return reject(c,'Неизвестное событие');\n  if(e.event!=='request')return c;\n  if(['WAITING_TRAVELLERS','AWAITING_DOCUMENT_RECEIPT','READY_FOR_TRIP','IN_TRIP','AWAITING_FEEDBACK','OPEN_CLAIM','CLOSED'].includes(s.status))return reject(c,'После согласования изменения обрабатывает менеджер.');\n  const p=e.patch||{},err=validatePatch(p);if(err)return reject(c,err);\n  s.brief={...s.brief,...p};s.revision++;c.planning=true;\n  // Invalidate dependent artefacts whenever the brief changes.\n  for(const k of ['proposal','approved_version','itinerary','services','visa','travel_pack','bookings','payment','documents','qa'])delete s[k];\n  const missing=required.filter(k=>s.brief[k]===undefined||s.brief[k]===null||s.brief[k]==='');\n  if(missing.length)return ask(c,'NEEDS_INFO','Уточните: '+missing.map(x=>labels[x]).join('; '),{missing_fields:missing});\n  const b=s.brief,errors=[];\n  if(!validDate(b.start_date)||!validDate(b.end_date))errors.push('Нужны действительные даты YYYY-MM-DD.');\n  if(!Number.isInteger(b.adults)||b.adults<1)errors.push('Количество взрослых должно быть целым положительным числом.');\n  if(!(b.budget_total>0))errors.push('Общий бюджет должен быть положительным.');\n  if(!/^\\S+@\\S+\\.\\S+$/.test(b.contact)&&!/^\\+?[0-9 ()-]{7,20}$/.test(b.contact))errors.push('Укажите e-mail или телефон.');\n  if(errors.length)return ask(c,'NEEDS_INFO',errors.join(' '),{validation_errors:errors});\n  return c;\n}\nfunction sg2(c){\n  if(c.halt||!c.planning)return c;\n  trace(c,'SG2','adaptive interview / requirement conflicts');\n  const b=c.s.brief,missing=interview.filter(k=>b[k]===undefined||b[k]===null||b[k]===''||(Array.isArray(b[k])&&!b[k].length));\n  if(missing.length)return ask(c,'NEEDS_PREFERENCES','Уточните предпочтения: '+missing.map(x=>labels[x]).join('; '),{missing_fields:missing});\n  const conflicts=[];\n  if(b.end_date<b.start_date)conflicts.push('Дата окончания раньше даты начала.');\n  const opposite=(b.must_have||[]).filter(x=>(b.avoid||[]).map(x=>x.toLowerCase()).includes(x.toLowerCase()));\n  if(opposite.length)conflicts.push('Одновременно обязательно и запрещено: '+opposite.join(', '));\n  if(conflicts.length)return ask(c,'NEEDS_RESOLUTION',conflicts.join(' '),{conflicts,alternatives:['Исправьте противоречащие параметры. Обязательные требования не меняются автоматически.']});\n  c.s.requirements={mandatory:{...clone(b)},negotiable:[],policy:'Only explicit client patch can change a requirement'};\n  return c;\n}\nfunction sg3(c){\n  if(c.halt||!c.planning)return c;\n  trace(c,'SG3','feasibility / mock visa / daily schedule');\n  const b=c.s.brief,n=days(b);\n  if(b.start_date<c.now.slice(0,10))return ask(c,'NEEDS_RESOLUTION','Дата начала уже прошла. Укажите новые даты.');\n  const unsupported=[];\n  if(b.origin!=='Москва'||b.destination!=='Санкт-Петербург')unsupported.push('каталог MVP: Москва → Санкт-Петербург');\n  if(n<2||n>7)unsupported.push('длительность MVP: 2–7 дней');\n  if(b.adults>6)unsupported.push('группа MVP: 1–6 взрослых');\n  if(b.currency!=='RUB')unsupported.push('валюта MVP: RUB');\n  if(![3,5].includes(b.hotel_stars))unsupported.push('отели MVP: 3 или 5 звёзд');\n  if(!['relaxed','standard'].includes(b.pace))unsupported.push('темп: relaxed / standard');\n  if(!['ru','en'].includes(b.guide_language))unsupported.push('язык гида: ru / en');\n  if(b.interests.some(x=>!['museums','architecture'].includes(x)))unsupported.push('интересы каталога: museums / architecture');\n  if((b.must_have||[]).length||(b.avoid||[]).length)unsupported.push('индивидуальные обязательные/запрещённые объекты требуют проверки менеджером');\n  if(unsupported.length)return stop(c,'MANAGER_REVIEW','Запрос вне проверенного демо-каталога. '+unsupported.join('; '),{unsupported});\n  c.s.visa={status:'MOCK_SUCCESS',source:'user-authorized assumption',checked_at:c.now};\n  c.s.itinerary=Array.from({length:n},(_,i)=>{\n    const date=iso(Date.parse(b.start_date)+86400000*i),slots=[];\n    if(i===0){slots.push({start:'08:00',end:'12:00',kind:'transport',title:'Сапсан (РЖД): Москва, Ленинградский вокзал → Санкт-Петербург, Московский вокзал'},{start:'12:00',end:'13:00',kind:'transfer',title:'Метро/такси от Московского вокзала до отеля, резерв'},{start:'13:00',end:'15:00',kind:'rest',title:'Обед, отдых, заселение с 14:00'});}\n    else slots.push({start:'09:00',end:'10:00',kind:'rest',title:'Завтрак и свободное время'});\n    if(i===n-1){slots.push({start:'10:00',end:'11:00',kind:'rest',title:'Выселение, хранение багажа'},{start:'12:00',end:'14:00',kind:'activity',title:b.interests.includes('architecture')?'Прогулка: Дворцовая площадь, Исаакиевский собор, Медный всадник':(new Date(date).getUTCDay()===1?'Русский музей (Инженерная ул., 4)':'Государственный Эрмитаж (Дворцовая наб., 34)'),opening:'10:00–18:00'},{start:'14:00',end:'16:00',kind:'rest',title:'Обед, багаж, резерв'},{start:'16:00',end:'17:00',kind:'transfer',title:'Метро/такси до Московского вокзала'},{start:'18:00',end:'22:00',kind:'transport',title:'Сапсан (РЖД): Санкт-Петербург, Московский вокзал → Москва, Ленинградский вокзал'});}\n    else if(i===0)slots.push({start:'15:00',end:'17:00',kind:'activity',title:b.interests.includes('museums')?(new Date(date).getUTCDay()===1?'Русский музей с гидом (Инженерная ул., 4)':'Государственный Эрмитаж с гидом (Дворцовая наб., 34)'):'Архитектурная прогулка с гидом: Невский проспект, Казанский собор, Спас на Крови',opening:'10:00–18:00'});\n    else slots.push({start:'10:00',end:b.pace==='relaxed'?'12:00':'13:00',kind:'free',title:'Свободная прогулка: '+b.interests.join(', ')+' (идеи: Петропавловская крепость, Новая Голландия, Летний сад)'},{start:'13:00',end:'18:00',kind:'rest',title:'Обед и свободное время. Платные услуги не включены.'});\n    return {date,city:'Санкт-Петербург',slots};\n  });\n  for(const day of c.s.itinerary)for(let i=1;i<day.slots.length;i++)if(day.slots[i].start<day.slots[i-1].end)return stop(c,'MANAGER_REVIEW','Конфликт расписания');\n  c.s.feasibility={mock:true,calendar:'synthetic daily opening 10–18',transport:'synthetic timetable',time_conflicts:0,free_days:n-2};\n  return c;\n}\nfunction sg4(c){\n  if(c.halt||!c.planning)return c;\n  trace(c,'SG4','filter and rank fixture services');\n  const b=c.s.brief;\n  const hotels=[{id:'H3-VEDENSKY',name:'Hotel Vedensky (3★), Санкт-Петербург',stars:3,night:4000,rating:4.5,center_minutes:20},{id:'H5-GRAND-EUROPE',name:'Гранд Отель Европа (5★), ул. Михайловская, 1/7',stars:5,night:15000,rating:4.9,center_minutes:10}];\n  c.s.services={mock:true,transport:{id:'RZD-SAPSAN-RETURN',name:'Сапсан (РЖД): Москва ⇄ Санкт-Петербург, 2 кл./эконом, туда-обратно',departure:b.start_date,return:b.end_date,adult_fare:4000},hotel:hotels.filter(h=>h.stars>=b.hotel_stars).sort((a,b)=>a.night-b.night)[0],nights:days(b)-1,rooms:Math.ceil(b.adults/2),guide:{id:'DEMO-GUIDE-'+b.guide_language,language:b.guide_language,date:b.start_date,from:'15:00',to:'17:00',contact:'guide@example.test'},transfers:2,activities:2,selection_reason:'Meet mandatory stars; lowest synthetic price among matching hotels',shortlist:hotels.filter(h=>h.stars>=b.hotel_stars)};\n  return c;\n}\nfunction sg5(c){\n  if(c.halt)return c;\n  const {e,s}=c;\n  if(c.planning){\n    trace(c,'SG5','exact arithmetic / budget gate / version proposal');\n    const q=quote(s.brief);\n    if(q.total>s.brief.budget_total){\n      const cheaper=quote(s.brief,3);\n      return ask(c,'NEEDS_RESOLUTION',`Демо-цена ${q.total} RUB превышает общий бюджет ${s.brief.budget_total} RUB. Что можно изменить?`,{conflicts:['BUDGET_VS_SERVICES'],calculation:q,alternatives:[{patch:{budget_total:q.total},description:'Увеличить бюджет, сохранить требования'},...(s.brief.hotel_stars===5?[{patch:{hotel_stars:3,budget_total:Math.max(s.brief.budget_total,cheaper.total)},description:`Отель 3 звезды: ${cheaper.total} RUB. Только после согласия клиента.`}]:[])]});\n    }\n    s.proposal_version++;\n    s.proposal={version:s.proposal_version,brief_revision:s.revision,created_at:c.now,valid_until:new Date(Date.parse(c.now)+86400000).toISOString(),mock:true,calculation:q,itinerary:clone(s.itinerary),services:clone(s.services),includes:['Поезд туда/обратно','Отель','2 групповых трансфера','2 посещения','1 экскурсия с гидом'],excludes:['Питание','Страхование','Личные расходы','Дополнительные платные активности'],conditions:'DEMO, не оферта. Цена действует 24 часа. Отмена: только через менеджера.'};\n    s.proposals.push(clone(s.proposal));\n    return stop(c,'AWAITING_APPROVAL',`Предложение v${s.proposal_version}: ${q.total} RUB за всю группу. Подтвердите эту версию или измените требования.`,{proposal:s.proposal});\n  }\n  if(e.event==='approve'){\n    trace(c,'SG5','explicit approval of current version');\n    if(s.status!=='AWAITING_APPROVAL'||!s.proposal)return reject(c,'Нет предложения, ожидающего согласования.');\n    if(e.proposal_version!==s.proposal.version)return reject(c,'Устаревшая или отсутствующая версия предложения.');\n    if(c.now>s.proposal.valid_until)return reject(c,'Предложение истекло. Отправьте request для пересчёта.');\n    s.approved_version=e.proposal_version;\n    say(c,'WAITING_TRAVELLERS','Предложение согласовано. Передайте тестовые данные всех туристов: full_name, birth_date, document_id.');\n  }\n  return c;\n}\nfunction sg6(c){\n  if(c.halt)return c;\n  const {e,s}=c;\n  if(!['approve','travellers'].includes(e.event))return c;\n  trace(c,'SG6','validate travellers / MOCK payment and bookings / quality');\n  if(s.status!=='WAITING_TRAVELLERS')return reject(c,'Сначала согласуйте актуальное предложение.');\n  if(!e.travellers)return stop(c,'WAITING_TRAVELLERS','Нужны тестовые данные всех туристов.');\n  if(!Array.isArray(e.travellers)||e.travellers.length!==s.brief.adults)return stop(c,'WAITING_TRAVELLERS','Число карточек туристов должно совпадать с размером группы.');\n  const ids=new Set();\n  for(const t of e.travellers){\n    if(typeof t.full_name!=='string'||t.full_name.trim().length<3||!validDate(t.birth_date)||typeof t.document_id!=='string'||!/^TEST-[A-Z0-9-]+$/.test(t.document_id))return stop(c,'WAITING_TRAVELLERS','Используйте полное имя, дату рождения и вымышленный document_id TEST-...');\n    const adultCutoff=Number(s.brief.start_date.replaceAll('-',''))-180000;\n    if(Number(t.birth_date.replaceAll('-',''))>adultCutoff||t.birth_date<'1900-01-01'||ids.has(t.document_id))return stop(c,'WAITING_TRAVELLERS','Нужны взрослые туристы и уникальные тестовые документы.');\n    ids.add(t.document_id);\n  }\n  s.travellers=clone(e.travellers);\n  s.documents={mock:true,contract_id:'DEMO-CONTRACT-'+s.request_id,invoice_id:'DEMO-INVOICE-'+s.request_id,amount:s.proposal.calculation.total,consent:'DEMO synthetic travellers only'};\n  s.payment={status:'MOCK_SUCCESS',reference:'DEMO-PAY-'+s.request_id,amount:s.documents.amount,currency:'RUB'};\n  s.bookings=['transport','hotel','activities','transfers','guide'].map(type=>({type,id:'DEMO-'+type.toUpperCase()+'-'+s.session_id,status:'MOCK_SUCCESS',proposal_version:s.approved_version,start_date:s.brief.start_date,end_date:s.brief.end_date}));\n  s.qa={travellers_match:true,dates_match:s.bookings.every(x=>x.start_date===s.brief.start_date&&x.end_date===s.brief.end_date),versions_match:s.approved_version===s.proposal.version,paid:s.payment.amount===s.proposal.calculation.total,guide_assigned:!!s.services.guide,calendar_conflicts:s.feasibility.time_conflicts};\n  if(!s.qa.dates_match||!s.qa.versions_match||!s.qa.paid||s.qa.calendar_conflicts)return stop(c,'MANAGER_REVIEW','Не пройдена финальная сверка.');\n  say(c,'BOOKED','Демо-бронирования подтверждены.');return c;\n}\nfunction sg7(c){\n  if(c.halt)return c;\n  const {e,s}=c;\n  if(s.status==='BOOKED'){\n    trace(c,'SG7','assemble and return travel pack');\n    const md=['# DEMO TRAVEL PACK',`Заказ ${s.request_id}; версия ${s.approved_version}`,`${s.brief.start_date} — ${s.brief.end_date}; ${s.brief.adults} взрослых`,...s.itinerary.flatMap(d=>[`## ${d.date}`,...d.slots.map(x=>`${x.start}–${x.end}: ${x.title}`)]),'## Подтверждения',...s.bookings.map(x=>`${x.type}: ${x.id} (${x.status})`),'## Контакты и инструкции',`Отель: ${s.services.hotel.name}; контакты и точный адрес — в подтверждении бронирования`,`DEMO гид: ${s.services.guide.contact}; встреча у входа в отель в 15:00 первого дня`,'Поддержка: support@example.test (вымышленный адрес)','Прибытие на Ленинградский вокзал (Москва) к отправлению Сапсана: минимум за 30 минут. По прибытии в Санкт-Петербург — метро или такси от Московского вокзала.','Названия отелей, музеев и поездов реальные, но бронирования, цены и расписание в демо-режиме ориентировочные: актуальные данные проверяйте у поставщиков.'].join('\\n');\n    s.travel_pack={mock:true,proposal_version:s.approved_version,markdown:md,documents:clone(s.documents),tickets_and_vouchers:clone(s.bookings),itinerary:clone(s.itinerary),contact:'support@example.test',delivery:'returned_in_webhook_response',received:false};\n    return stop(c,'AWAITING_DOCUMENT_RECEIPT','Travel pack готов. Подтвердите получение событием ack_documents.',{travel_pack:s.travel_pack});\n  }\n  if(e.event==='ack_documents'){\n    if(s.status!=='AWAITING_DOCUMENT_RECEIPT')return reject(c,'Нет пакета, ожидающего подтверждения.');\n    s.travel_pack.received=true;return stop(c,'READY_FOR_TRIP','Получение документов подтверждено. Ожидается start_trip.');\n  }\n  if(e.event==='start_trip'){\n    if(s.status!=='READY_FOR_TRIP')return reject(c,'Сначала подтвердите получение travel pack.');\n    s.trip_started_at=c.now;return stop(c,'IN_TRIP','Поездка началась (событие учебного симулятора).');\n  }\n  if(e.event==='question'){\n    if(!s.travel_pack)return reject(c,'Travel pack ещё не создан.');\n    return stop(c,s.status,'Используйте актуальный travel pack. Индивидуальный вопрос передан менеджеру.',{travel_pack:s.travel_pack,manager_question:e.message||''});\n  }\n  if(e.event==='incident'){\n    if(s.status!=='IN_TRIP')return reject(c,'Инцидент принимается во время поездки.');\n    if(typeof e.message!=='string'||!e.message.trim())return reject(c,'Опишите инцидент.');\n    const inc={id:'INC-'+(s.incidents.length+1),message:e.message,status:'OPEN',assignee:'manager',resolution:null,created_at:c.now};s.incidents.push(inc);\n    return stop(c,'IN_TRIP','Инцидент зарегистрирован и передан менеджеру.',{incident:inc});\n  }\n  if(e.event==='resolve_incident'){\n    const inc=s.incidents.find(x=>x.id===e.incident_id&&x.status==='OPEN');\n    if(!inc||typeof e.resolution!=='string'||!e.resolution.trim())return reject(c,'Нужны открытый incident_id и решение менеджера.');\n    inc.status='RESOLVED';inc.resolution=e.resolution;return stop(c,s.status,'Решение инцидента сохранено.');\n  }\n  return c;\n}\nfunction sg8(c){\n  if(c.halt)return c;\n  const {e,s}=c;\n  if(e.event==='end_trip'){\n    if(s.status!=='IN_TRIP')return reject(c,'Поездка ещё не началась.');\n    s.trip_ended_at=c.now;trace(c,'SG8','trip ended / request feedback');\n    return stop(c,'AWAITING_FEEDBACK','Оцените тур: CSAT 1–5, NPS 0–10, текст. Можно явно пропустить отзыв.');\n  }\n  if(e.event==='feedback'){\n    if(!['AWAITING_FEEDBACK','OPEN_CLAIM'].includes(s.status))return reject(c,'Отзыв принимается только после end_trip.');\n    if(e.skip!==true&&(!Number.isInteger(e.csat)||e.csat<1||e.csat>5||!Number.isInteger(e.nps)||e.nps<0||e.nps>10))return reject(c,'CSAT: целое 1–5. NPS: целое 0–10.');\n    s.feedback=e.skip===true?{skipped:true}:{csat:e.csat,nps:e.nps,text:e.message||'',sentiment:e.csat>=4?'positive':e.csat<=2?'negative':'neutral'};\n    if(e.complaint===true||(e.skip!==true&&e.csat<=2))s.claims.push({id:'CLAIM-'+(s.claims.length+1),status:'OPEN',text:e.message||'Низкая оценка',draft:'Менеджер должен проверить обстоятельства и подготовить ответ.',context:{proposal_version:s.approved_version,bookings:clone(s.bookings),incidents:clone(s.incidents)}});\n  }else if(e.event==='resolve_claim'){\n    if(s.status!=='OPEN_CLAIM')return reject(c,'Нет претензии на рассмотрении.');\n    const claim=s.claims.find(x=>x.id===e.claim_id&&x.status==='OPEN');\n    if(!claim||typeof e.resolution!=='string'||!e.resolution.trim())return reject(c,'Нужны claim_id и решение менеджера.');\n    claim.status='RESOLVED';claim.resolution=e.resolution;\n  }else return c;\n  trace(c,'SG8','mock reconciliation / KPIs / closure gate');\n  const q=s.proposal.calculation;\n  s.financials={mock:true,revenue:s.payment.amount,actual_supplier_cost:q.cost,reserve_used:0,actual_profit:s.payment.amount-q.cost,reconciled:s.payment.amount===q.total};\n  s.kpis={csat:s.feedback.csat??null,nps_response:s.feedback.nps??null,nps_segment:s.feedback.nps===undefined?null:s.feedback.nps>=9?'promoter':s.feedback.nps>=7?'passive':'detractor',incident_count:s.incidents.length,proposal_versions:s.proposal_version,clarification_rounds:s.clarification_rounds,actual_profit:s.financials.actual_profit};\n  const open=s.claims.filter(x=>x.status==='OPEN').length+s.incidents.filter(x=>x.status==='OPEN').length;\n  if(open)return stop(c,'OPEN_CLAIM','Есть открытые претензии или инциденты. Закрытие заблокировано.',{open_items:open});\n  if(!s.trip_ended_at||!s.travel_pack.received||!s.financials.reconciled)return stop(c,'MANAGER_REVIEW','Не выполнены условия закрытия.');\n  s.closed_at=c.now;s.archive={mock:true,request_id:s.request_id,proposal_versions:s.proposals.length,archived_at:c.now};\n  return stop(c,'CLOSED','Заказ закрыт в учебном контуре.',{kpis:s.kpis,financials:s.financials});\n}\nconst stages=[sg1,sg2,sg3,sg4,sg5,sg6,sg7,sg8];\nfunction run(input, old, now){let c=context(input,old,now);for(const fn of stages)c=fn(c);if(!Object.keys(c.response).length)c=reject(c,'Событие не применимо к текущему статусу.');c.s.audit.push({at:c.now,event:c.e.event,status:c.s.status,trace:c.trace});return c;}\n\nconst chat=$('Chat Trigger').first().json;\nconst msg=String(chat.chatInput||'').trim(),sid=String(chat.sessionId||'');\nlet old=null;\nfunction scan(x){if(typeof x==='string'&&x.startsWith('TRAVEL_STATE:')){try{const p=JSON.parse(x.slice(13));if(p.schema==='travel_mvp_state_v1'&&p.state.session_id===sid)old=p.state;}catch{}}else if(Array.isArray(x))x.forEach(scan);else if(x&&typeof x==='object')Object.values(x).forEach(scan);}\n$input.all().forEach(i=>scan(i.json));\nconst now=new Date().toISOString();\nconst e={session_id:sid,event_id:String($execution.id),event:'request'};\nconst c=context(e,old,now);\nconst help='Lệnh demo / команды:\\n/demo1 — đủ thông tin / полный запрос\\n/demo2 — thiếu thông tin / неполный запрос\\n/demo3 — mâu thuẫn ngân sách / конфликт\\n/fill — bổ sung dữ liệu mẫu\\n/resolve — chọn 3 sao, ngân sách 60000 RUB\\n/approve 1 — đồng ý báo giá v1, dùng hồ sơ khách DEMO\\n/received — xác nhận nhận travel pack\\n/start — bắt đầu tour DEMO\\n/end — kết thúc tour DEMO\\n/feedback 5 9 — CSAT 5/5, NPS 9/10\\n/reset — xóa hồ sơ của chat này\\n/status — xem trạng thái\\n\\nBạn cũng có thể gõ yêu cầu du lịch bằng tiếng Nga/Việt khi đã gắn OpenAI credential. Mọi dịch vụ là giả lập.';\nconst start=new Date();start.setUTCDate(start.getUTCDate()+30);const end=new Date(start);end.setUTCDate(end.getUTCDate()+2);\nconst demo={origin:'Москва',destination:'Санкт-Петербург',start_date:iso(start),end_date:iso(end),adults:2,budget_total:60000,currency:'RUB',contact:'demo@example.test',hotel_stars:3,pace:'relaxed',interests:['museums','architecture'],guide_language:'ru',must_have:[],avoid:[]};\nconst cmd=msg.toLowerCase();\nif(!sid||!msg||msg.length>6000){c.halt=true;c.response={status:'INVALID_INPUT',message:'Нужны sessionId и сообщение (до 6000 символов).'};}\nelse if(['/help','help','hi','hello','xin chào','привет','здравствуйте'].includes(cmd)){c.halt=true;c.response={status:c.s.status,message:help};}\nelse if(cmd==='/reset'){c.s=initial(sid,now);c.halt=true;c.response={status:'NEW',message:'Đã xóa hồ sơ phiên này. Начните с /demo1, /demo2, /demo3 или напишите запрос.'};}\nelse if(cmd==='/status'){c.halt=true;c.response={status:c.s.status,message:JSON.stringify({status:c.s.status,brief:c.s.brief,proposal_version:c.s.proposal_version},null,2)};}\nelse if(['/demo1','/demo2','/demo3'].includes(cmd)){\n c.s=initial(sid,now);\n c.e.patch=cmd==='/demo2'?{destination:demo.destination,adults:2,contact:demo.contact}:cmd==='/demo3'?{...demo,hotel_stars:5,budget_total:20000}:demo;\n}\nelse if(cmd==='/fill'){c.e.patch={...demo,...c.s.brief};}\nelse if(cmd==='/resolve'){c.e.patch={hotel_stars:3,budget_total:60000};}\nelse if(/^\\/approve\\s+\\d+$/.test(cmd)){\n c.e.event='approve';c.e.proposal_version=Number(cmd.split(/\\s+/)[1]);\n const count=c.s.brief.adults||0;\n c.e.travellers=Array.from({length:count},(_,i)=>({full_name:'DEMO Tourist '+(i+1),birth_date:'1995-01-01',document_id:'TEST-CHAT-'+(i+1)}));\n}\nelse if(cmd==='/received')c.e.event='ack_documents';\nelse if(cmd==='/start')c.e.event='start_trip';\nelse if(cmd==='/end')c.e.event='end_trip';\nelse if(/^\\/feedback\\s+\\d+\\s+\\d+$/.test(cmd)){const parts=cmd.split(/\\s+/);c.e.event='feedback';c.e.csat=Number(parts[1]);c.e.nps=Number(parts[2]);c.e.message='DEMO feedback';}\nelse if(cmd==='/skip'){c.e.event='feedback';c.e.skip=true;}\nelse if(cmd.startsWith('/incident ')){c.e.event='incident';c.e.message=msg.slice(10);}\nelse if(cmd.startsWith('/resolve_incident ')){const p=msg.split(/\\s+/);c.e.event='resolve_incident';c.e.incident_id=p[1];c.e.resolution=p.slice(2).join(' ');}\nelse if(cmd.startsWith('/resolve_claim ')){const p=msg.split(/\\s+/);c.e.event='resolve_claim';c.e.claim_id=p[1];c.e.resolution=p.slice(2).join(' ');}\nelse if(cmd.startsWith('/')){c.halt=true;c.response={status:c.s.status,message:'Lệnh chưa đúng. Gõ /help để xem hướng dẫn.'};}\nelse if(msg.startsWith('{')){try{const p=JSON.parse(msg);c.e={...p,session_id:sid,event_id:String($execution.id),event:p.event||'request'};}catch{c.halt=true;c.response={status:c.s.status,message:'JSON không hợp lệ.'};}}\nelse {c.e.message=msg;}\nc.use_llm=!c.halt&&c.e.event==='request'&&!!c.e.message;\nif(!c.use_llm){\n  if(!c.halt){\n    for(const fn of stages)fn(c);\n    if(!Object.keys(c.response).length)reject(c,'Событие не применимо к текущему статусу.');\n    c.s.audit.push({at:c.now,event:c.e.event,status:c.s.status,trace:c.trace});\n  }\n  const R=c.response||{};\n  const L=[String(R.message||'')];\n  if(R.calculation)L.push('Расчёт (демо): итого '+R.calculation.total+' RUB');\n  if(Array.isArray(R.alternatives))R.alternatives.forEach((a,i)=>L.push((i+1)+') '+a.description));\n  if(R.proposal){const p=R.proposal;L.push('Итого: '+p.calculation.total+' RUB (демо)');p.itinerary.forEach(d=>{L.push('## '+d.date);d.slots.forEach(x=>L.push(x.start+'–'+x.end+' '+x.title));});L.push('Включено: '+p.includes.join(', '));L.push('Не включено: '+p.excludes.join(', '));L.push(p.conditions);L.push('Для согласования: /approve '+p.version);}\n  if(R.travel_pack)L.push(R.travel_pack.markdown);\n  if(R.kpis)L.push('KPI: '+JSON.stringify(R.kpis));\n  c.output=L.filter(Boolean).join('\\n');\n  c.state_blob=sid?('TRAVEL_STATE:'+JSON.stringify({schema:'travel_mvp_state_v1',state:c.s})):'';\n}\nreturn [{json:c}];"
+      },
+      "id": "3093488e-7fdb-46aa-90df-9a9e649ccf8f",
+      "name": "Prepare session",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1488,
+        720
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "text-condition",
+              "leftValue": "={{ $json.use_llm }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "e656e4ae-da62-47a1-8226-f4397b321fce",
+      "name": "Need text extraction?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1712,
+        720
+      ]
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ $json.e.message }}",
+        "options": {
+          "systemMessage": "Ты — AI-консультант туристического агентства. ЯЗЫК ОТВЕТА (обязательно): ВСЕГДА отвечай ТОЛЬКО на русском языке, даже если клиент пишет на другом языке (вьетнамском, английском и т.д.). Не смешивай языки в одном ответе. Вежливые отказы, уточняющие вопросы, сметы, планы и благодарности — всё по-русски.\nОГРАНИЧЕНИЯ ТЕМЫ: ты отвечаешь ТОЛЬКО на вопросы, связанные с планированием путешествий и туристическими услугами. Если запрос не про путешествия (программирование, математика, политика и т.п.) — вежливо откажи одним-двумя предложениями, не выполняй его и предложи описать планы поездки. Если в сообщении есть и туристическая, и посторонняя часть — ответь только на туристическую, а постороннюю вежливо пропусти.\nИНСТРУМЕНТ КАТАЛОГА (обязательно): для поездки Москва → Санкт-Петербург ПЕРЕД составлением сметы и плана вызови инструмент search_catalog для категорий hotel, transport, transfer, activity, guide (city = «Санкт-Петербург») и бери названия, районы и цены ТОЛЬКО из результатов каталога; не называй отели и цены, которых нет в каталоге, помечай их как демо-цены. Для других направлений каталога нет: действуй по прежним правилам и явно помечай данные как оценку.\nПРАВИЛА ПРОВЕРОК И ЦЕНЫ (обязательно, ПРИОРИТЕТ над всеми прочими правилами о резерве и смете ниже): 1) ЭТАП 3, ВЫПОЛНИМОСТЬ: когда известны направление, даты и число людей, ВЫЗОВИ инструмент check_feasibility (origin, destination_country, start_date, end_date, adults, citizenship). Если поездка не внутри России и гражданство неизвестно — сначала спроси гражданство. Если verdict = NOT_FEASIBLE или MANAGER_REVIEW — НЕ составляй смету и план: объясни причины (issues) по-русски, расскажи про визу и предложи изменить даты или направление либо передать запрос менеджеру. Если FEASIBLE_WITH_WARNINGS — кратко перечисли warnings и визовую заметку в начале ответа и продолжай. 2) ЭТАП 6, ЦЕНА: после search_catalog посчитай СЕБЕСТОИМОСТЬ по статьям (transport, hotel, activities, local_transport, other — числа в рублях из каталога) и ВЫЗОВИ calculate_pricing (передай budget клиента, international и high_season из check_feasibility). Цена для клиента = client_price из инструмента; резерв и маржу НЕ считай сам и НЕ используй «резерв 10%». Клиенту показывай статьи сметы и итог client_price; себестоимость, маржу и прибыль клиенту НЕ показывай. В строке [[BUDGET]] значение MAX = client_price. Если over_budget = true: покажи превышение (gap), 2–3 альтернативы с пересчётом через calculate_pricing, и если manager_can_reduce_margin = true — можно сказать, что менеджер может рассмотреть скидку. Не придумывай цифры вместо результата инструментов.\nE-MAIL КЛИЕНТА (необязательно): при уточняющих вопросах один раз спроси e-mail, куда отправить ссылку на план; не блокируй план, если клиент не хочет его указывать. Никогда не придумывай адрес.\nЦель: по описанию поездки составить реалистичный план с РЕАЛЬНЫМИ достопримечательностями, РЕАЛЬНЫМИ отелями и РЕАЛЬНЫМ транспортом (авиакомпании/поезда/метро/такси/аренда) для выбранного направления.\nНужные данные: город отправления, направление, даты (или число дней), число путешественников, общий бюджет и валюта, интересы, темп (спокойный/обычный), желаемая категория отеля. Если чего-то важного не хватает — задай 1–3 коротких уточняющих вопроса и НЕ составляй план. Ничего не выдумывай за пользователя.\nКогда данных достаточно, дай план: 1) краткое резюме; 2) транспорт туда-обратно и внутри города; 3) 2–3 реальных отеля с районом и ориентировочной ценой за ночь, один рекомендуемый; 4) программа по дням с временем, реальными местами, адресом/районом и способом добраться; 5) ориентировочная смета по статьям в валюте пользователя и сравнение с бюджетом; 6) практические советы.\nПравила честности: у тебя нет доступа к ценам, наличию и расписанию в реальном времени. Все цены и время помечай как ориентировочные и советуй проверить на сайте перевозчика/отеля/музея. Ничего не бронируй и не обещай бронирование. Не придумывай несуществующие места; если не уверен — скажи об этом. Учитывай дни закрытия музеев и реалистичное время в пути.\nТОЧНОСТЬ ТРАНСПОРТА (обязательно): для Сапсана Москва → Санкт-Петербург отправление ТОЛЬКО с Ленинградского вокзала (Москва), прибытие на Московский вокзал (Санкт-Петербург). Обратно наоборот: отправление с Московского вокзала (СПб), прибытие на Ленинградский вокзал (Москва). Никогда не путай эти вокзалы. Для других направлений указывай конкретный вокзал/аэропорт только если уверен; если не уверен — пиши «уточните вокзал/терминал при покупке билета».\nПОРЯДОК РАБОТЫ С БЮДЖЕТОМ (строго): 1) сначала молча посчитай смету по статьям и итог «минимум–максимум» (максимум с резервом 10%); 2) сравни МАКСИМУМ с бюджетом; 3) только потом пиши ответ. Вердикт в начале ответа ДОЛЖЕН совпадать с итоговой таблицей — никогда не пиши «укладывается», если максимум в таблице выше бюджета. Если максимум выше бюджета: НЕ пиши программу по дням и список отелей целиком, покажи только таблицу сметы, превышение в рублях и процентах, 2–3 альтернативы с пересчитанной сметой (максимум каждой альтернативы должен быть не выше бюджета) и вопрос, какой вариант выбрать. Версию-черновик с программой по дням показывай только когда максимум сметы не выше бюджета.\nЧЕСТНЫЙ ВЕРДИКТ ПО БЮДЖЕТУ (обязательно): сравнивай с бюджетом ВЕРХНЮЮ границу сметы (с резервом 10%), а не середину и не нижнюю. Если верхняя граница выше бюджета — это превышение: действуй по правилу ниже (альтернативы, без маркера [[ITINERARY]]), даже если нижняя граница укладывается. Если верхняя граница укладывается в бюджет — пиши «укладывается в бюджет» и указывай запас в рублях. Не пиши «может уложиться при выборе дешёвого тарифа» как положительный вердикт: либо укладывается по верхней границе, либо предложи альтернативы. Если клиент сам подтвердил, что принимает риск превышения или повысил бюджет — можно выдать финальный план, указав верхнюю границу сметы и остаточный риск.\nПРОВЕРКА БЮДЖЕТА (обязательно): перед выдачей финального плана посчитай итоговую смету (транспорт + отель + питание + экскурсии/билеты + местный транспорт + резерв 10%) и сравни с бюджетом клиента. Если смета ПРЕВЫШАЕТ бюджет — НЕ используй маркер [[ITINERARY]] и не составляй полный план. Вместо этого покажи краткую таблицу сметы, на сколько и в процентах превышение, и предложи 2–3 конкретные альтернативы без критического ухудшения поездки (например: отель категорией ниже, другой класс/время поезда, меньше платных экскурсий, сдвиг дат, на 1 день короче) с новой ориентировочной ценой каждой. Спроси клиента, какой вариант выбрать или готов ли он увеличить бюджет. Если клиент выбрал альтернативу, согласился повысить бюджет или смета укладывается в бюджет — выдай финальный план с маркером. Если бюджет не указан — сначала спроси его. Если бюджет заведомо нереалистичен (например, меньше стоимости транспорта) — честно скажи об этом и предложи минимально реальную сумму.\nСОГЛАСОВАНИЕ С КЛИЕНТОМ (обязательно): когда данных достаточно и бюджет в порядке, сначала покажи ЧЕРНОВИК плана с пометкой «Версия N» (начинай с 1) БЕЗ маркера [[ITINERARY]] и в конце спроси: «Подтверждаете этот вариант? Ответьте «подтверждаю» или напишите, что изменить». Если клиент просит правки — выдай новую полную версию (N+1), снова БЕЗ маркера, и снова попроси подтверждение. Только когда клиент явно подтвердил последнюю версию (например: «подтверждаю», «ок», «согласен», «да, оформляйте»), выдай финальную версию.\nОБРАТНАЯ СВЯЗЬ: после утверждённого плана система сама просит клиента оценить обслуживание от 1 до 5 и оставить комментарий. Если клиент отвечает на этот запрос (оценка 1–5 и/или комментарий), ответь так: первая строка ровно [[FEEDBACK]], вторая строка RATING: число, третья строка COMMENT: комментарий клиента (или пусто), затем коротко поблагодари; если RATING равен 1 или 2 — искренне извинись и сообщи, что менеджер свяжется с клиентом. В таком ответе [[ITINERARY]] не используй.\nМАШИННАЯ СТРОКА БЮДЖЕТА (обязательно): в КАЖДОМ черновике плана и в каждом финальном плане добавляй отдельной последней строкой ровно: [[BUDGET]] MAX: <число>; BUDGET: <число> — где MAX это верхняя граница сметы с резервом 10% в валюте клиента, BUDGET это бюджет клиента, только цифры без пробелов и символов. Система сама сравнит числа и заблокирует план, если MAX выше BUDGET. Эту строку не добавляй в уточняющие вопросы и сообщения о превышении бюджета.\nФОРМАТ ФИНАЛЬНОГО ПЛАНА (только после подтверждения клиента): самая первая строка ответа — ровно [[ITINERARY]], вторая строка — TITLE: короткое название поездки, третья строка (только если клиент указал e-mail) — EMAIL: адрес, затем утверждённый план в Markdown, в конце одна строка: «Версия N, утверждено клиентом». Маркер [[ITINERARY]] НЕ используй в уточняющих вопросах, черновиках, сообщениях о превышении бюджета и обычных ответах."
+        }
+      },
+      "id": "d83872ea-dce0-4525-88e4-2567f63ad25d",
+      "name": "AI Travel Planner",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 3.1,
+      "position": [
+        2608,
+        608
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "value": "gpt-5.4-mini",
+          "mode": "list",
+          "cachedResultName": "gpt-5.4-mini"
+        },
+        "builtInTools": {},
+        "options": {
+          "temperature": 0.4
+        }
+      },
+      "id": "649bca01-1efa-4b7e-b978-18092a2f4aa2",
+      "name": "OpenAI Chat Model",
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.3,
+      "position": [
+        2496,
+        880
+      ],
+      "credentials": {
+        "openAiApi": {
+          "id": null,
+          "name": "Gateway credits",
+          "__aiGatewayManaged": true
+        }
+      }
+    },
+    {
+      "parameters": {
+        "sessionIdType": "customKey",
+        "sessionKey": "={{ $('Chat Trigger').item.json.sessionId }}",
+        "contextWindowLength": 20
+      },
+      "id": "59ee734f-3a8d-4d8b-92a3-18d3de687150",
+      "name": "Travel chat memory",
+      "type": "@n8n/n8n-nodes-langchain.memoryBufferWindow",
+      "typeVersion": 1.3,
+      "position": [
+        2944,
+        912
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "ZCj7cEu6zOZQ1nxk"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "category",
+              "keyValue": "={{ /*n8n-auto-generated-fromAI-override*/ $fromAI('category', 'Категория: hotel, transport, transfer, activity или guide') }}"
+            },
+            {
+              "keyName": "city",
+              "keyValue": "={{ /*n8n-auto-generated-fromAI-override*/ $fromAI('city', 'Город назначения, точно: Санкт-Петербург') }}"
+            }
+          ]
+        },
+        "limit": 20
+      },
+      "id": "ff2eeef1-4e35-411d-bdcb-f3513d426dd3",
+      "name": "search_catalog",
+      "type": "n8n-nodes-base.dataTableTool",
+      "typeVersion": 1.1,
+      "position": [
+        3248,
+        1024
+      ]
+    },
+    {
+      "parameters": {
+        "description": "Фиксированные правила проверки выполнимости поездки и визового режима (этап 3). Вызывай ОБЯЗАТЕЛЬНО до сметы и плана. Возвращает JSON: verdict (FEASIBLE, FEASIBLE_WITH_WARNINGS, NOT_FEASIBLE, MANAGER_REVIEW), issues, warnings, visa, international, high_season.",
+        "jsCode": "let q = query;\nif (typeof q === 'string') { try { q = JSON.parse(q); } catch (e) { return JSON.stringify({verdict:'MANAGER_REVIEW', issues:['Неверный формат входных данных']}); } }\nconst issues = [];\nconst warnings = [];\nconst today = new Date().toISOString().slice(0,10);\nconst s = String(q.start_date || '');\nconst e = String(q.end_date || '');\nconst ds = Date.parse(s);\nconst de = Date.parse(e);\nlet days = 0;\nlet daysToStart = 0;\nif (!isFinite(ds) || !isFinite(de)) { issues.push('Некорректные даты (нужен формат YYYY-MM-DD)'); }\nelse {\n  days = Math.round((de - ds) / 86400000) + 1;\n  daysToStart = Math.round((ds - Date.parse(today)) / 86400000);\n  if (s < today) issues.push('Дата начала уже прошла');\n  if (e < s) issues.push('Дата окончания раньше даты начала');\n  if (days > 21) issues.push('Поездка длиннее 21 дня: требуется менеджер');\n  if (days === 1) warnings.push('Поездка в один день: ночёвки нет, проверьте билеты туда-обратно');\n  if (daysToStart >= 0 && daysToStart < 3) warnings.push('До начала меньше 3 дней: наличие билетов и мест в отелях ограничено');\n}\nconst adults = Number(q.adults);\nif (!(adults >= 1)) issues.push('Нужно указать число путешественников');\nelse if (adults > 9) issues.push('Группа больше 9 человек: требуется менеджер');\nconst dest = String(q.destination_country || 'Россия').trim().toLowerCase();\nconst cit = String(q.citizenship || 'Россия').trim().toLowerCase();\nconst domestic = ['россия','рф','russia'].indexOf(dest) >= 0;\nconst visaFree = ['беларусь','турция','оаэ','таиланд','вьетнам','грузия','армения','казахстан','сербия','узбекистан','киргизия','азербайджан','куба','мальдивы'];\nconst visaOnArrival = ['египет','шри-ланка','камбоджа','лаос','индонезия'];\nconst visaRequired = ['сша','великобритания','канада','австралия','япония','индия','франция','италия','испания','германия','греция','чехия','португалия','австрия','швейцария','нидерланды','финляндия','эстония','латвия','литва','польша'];\nconst ruCit = ['россия','рф','russia','российская федерация'].indexOf(cit) >= 0;\nlet visa = {status:'NOT_NEEDED', note:'Поездка внутри России: нужен паспорт РФ'};\nif (!domestic) {\n  if (!ruCit) { visa = {status:'UNKNOWN', note:'Правила в демо заданы только для граждан РФ'}; issues.push('Гражданство не РФ: визовый режим проверяет менеджер'); }\n  else if (visaFree.indexOf(dest) >= 0) { visa = {status:'VISA_FREE', note:'Виза не нужна (демо-правила). Паспорт действителен минимум 6 месяцев после возвращения'}; }\n  else if (visaOnArrival.indexOf(dest) >= 0) { visa = {status:'ON_ARRIVAL_OR_EVISA', note:'Виза по прибытии или электронная (демо-правила). Нужен паспорт минимум 6 месяцев и обратный билет'}; warnings.push('Проверьте условия визы по прибытии/e-visa у официального источника'); }\n  else if (visaRequired.indexOf(dest) >= 0) {\n    visa = {status:'VISA_REQUIRED', note:'Нужна виза, оформление около 15 рабочих дней (демо-правила)'};\n    if (daysToStart < 21) issues.push('Нужна виза, а до начала поездки меньше 21 дня: успеть оформить нереально');\n    else warnings.push('Нужна виза: подайте документы заранее');\n  }\n  else { visa = {status:'UNKNOWN', note:'Страна вне таблицы правил'}; issues.push('Страна ' + String(q.destination_country) + ' вне таблицы правил: визовый режим проверяет менеджер'); }\n}\nconst md = s.slice(5);\nconst highSeason = (md >= '12-26' || md <= '01-10') || (md >= '04-29' && md <= '05-11') || (md >= '07-01' && md <= '08-31');\nif (highSeason) warnings.push('Высокий сезон: билеты и отели дороже, возможен дефицит мест');\nlet verdict = 'FEASIBLE';\nconst hard = issues.some(function (x) { return x.indexOf('менеджер') >= 0 || x.indexOf('вне таблицы') >= 0; });\nif (issues.length) verdict = hard ? 'MANAGER_REVIEW' : 'NOT_FEASIBLE';\nelse if (warnings.length) verdict = 'FEASIBLE_WITH_WARNINGS';\nreturn JSON.stringify({verdict: verdict, issues: issues, warnings: warnings, visa: visa, international: !domestic, high_season: highSeason, days: days, note: 'Демо-правила; сверяйте с официальными источниками'});",
+        "specifyInputSchema": true,
+        "jsonSchemaExample": "{\"origin\":\"Москва\",\"destination_country\":\"Россия\",\"start_date\":\"2026-11-12\",\"end_date\":\"2026-11-14\",\"adults\":2,\"citizenship\":\"Россия\"}"
+      },
+      "id": "4bc5e7d5-1893-470d-a576-57cfd82a89cb",
+      "name": "check_feasibility",
+      "type": "@n8n/n8n-nodes-langchain.toolCode",
+      "typeVersion": 1.3,
+      "position": [
+        3488,
+        832
+      ]
+    },
+    {
+      "parameters": {
+        "description": "Фиксированный расчёт цены (этап 6): себестоимость, резерв, маржа, цена для клиента. Входные суммы — себестоимость по статьям в рублях (число, без символов). Вызывай ОБЯЗАТЕЛЬНО перед показом сметы. Возвращает JSON с client_price (то, что видит клиент и что идёт в MAX), over_budget, gap и подсказками. Себестоимость и маржу клиенту не показывай.",
+        "jsCode": "let q = query;\nif (typeof q === 'string') { try { q = JSON.parse(q); } catch (e) { return JSON.stringify({error:'Неверный формат входных данных'}); } }\nconst n = function (x) { const v = Number(x); return isFinite(v) && v > 0 ? v : 0; };\nconst cost = n(q.transport) + n(q.hotel) + n(q.activities) + n(q.local_transport) + n(q.other);\nif (cost <= 0) return JSON.stringify({error:'Нужна себестоимость по статьям (положительные числа)'});\nconst intl = q.international === true || q.international === 'true';\nconst hs = q.high_season === true || q.high_season === 'true';\nconst reservePct = (intl ? 0.08 : 0.05) + (hs ? 0.03 : 0);\nconst marginPct = intl ? 0.20 : 0.15;\nconst minMarginPct = 0.10;\nconst up = function (x) { return Math.ceil(x / 100) * 100; };\nconst reserve = Math.round(cost * reservePct);\nconst margin = Math.round(cost * marginPct);\nconst clientPrice = up(cost + reserve + margin);\nconst profit = clientPrice - cost - reserve;\nconst minPrice = up(cost + reserve + Math.round(cost * minMarginPct));\nconst budget = n(q.budget);\nconst overBudget = budget > 0 && clientPrice > budget;\nconst gap = overBudget ? clientPrice - budget : 0;\nconst maxCost = budget > 0 ? Math.floor(budget / (1 + reservePct + marginPct)) : 0;\nconst res = {\n  client_price: clientPrice,\n  internal: {cost: cost, reserve: reserve, reserve_pct: Math.round(reservePct * 100), planned_profit: profit, margin_pct_of_price: Math.round(profit * 1000 / clientPrice) / 10},\n  over_budget: overBudget,\n  gap: gap,\n  budget_headroom: budget > 0 && !overBudget ? budget - clientPrice : 0,\n  cost_to_fit_budget: maxCost,\n  required_cost_cut: overBudget ? Math.max(0, cost - maxCost) : 0,\n  manager_can_reduce_margin: overBudget && budget >= minPrice,\n  min_price_with_min_margin: minPrice,\n  rules: 'резерв ' + Math.round(reservePct * 100) + '% от себестоимости; маржа ' + Math.round(marginPct * 100) + '% от себестоимости; минимальная маржа ' + Math.round(minMarginPct * 100) + '%'\n};\nreturn JSON.stringify(res);",
+        "specifyInputSchema": true,
+        "jsonSchemaExample": "{\"transport\":8000,\"hotel\":12000,\"activities\":4000,\"local_transport\":2000,\"other\":1000,\"budget\":120000,\"international\":false,\"high_season\":false}"
+      },
+      "id": "555c3b6e-1af4-4da9-92f7-2a6cb3825147",
+      "name": "calculate_pricing",
+      "type": "@n8n/n8n-nodes-langchain.toolCode",
+      "typeVersion": 1.3,
+      "position": [
+        3616,
+        832
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const raw0 = String($json.output || '').trim();\nconst bm = raw0.match(/\\[\\[BUDGET\\]\\]\\s*MAX:\\s*([\\d\\s.,]+?)\\s*;\\s*BUDGET:\\s*([\\d\\s.,]+)/);\nconst num = (x) => parseInt(String(x).replace(/\\D/g,'')) || 0;\nlet raw = raw0.split('\\n').filter(l => l.indexOf('[[BUDGET]]') === -1).join('\\n').trim();\nlet blocked = false;\nif (bm) {\n  const mx = num(bm[1]); const bd = num(bm[2]);\n  if (bd > 0 && mx > bd) { blocked = true; raw = '⚠️ Проверка бюджета: верхняя граница сметы ' + mx + ' превышает бюджет ' + bd + ' на ' + (mx - bd) + ' (' + Math.round((mx - bd) * 100 / bd) + '%). План не отправлен. Выберите: 1) увеличить бюджет, 2) более дешёвый отель/транспорт, 3) сократить программу или дни. Напишите, какой вариант выбрать.'; }\n}\nconst em = raw.match(/^EMAIL:\\s*([^\\s@]+@[^\\s@]+\\.[^\\s@]+)\\s*$/m);\nconst clientEmail = em ? em[1] : '';\nraw = raw.split('\\n').filter(l => !/^EMAIL:/.test(l.trim())).join('\\n').trim();\nconst has = raw.includes('[[ITINERARY]]');\nconst lines = raw.replace('[[ITINERARY]]', '').trim().split('\\n');\nlet title = '';\nconst rest = [];\nfor (const l of lines) { if (!title && l.trim().startsWith('TITLE:')) { title = l.trim().slice(6).trim(); } else { rest.push(l); } }\nconst fb = raw.includes('[[FEEDBACK]]');\nlet rating = 0; let comment = '';\nif (fb) { const m = raw.match(/RATING:\\s*(\\d)/); rating = m ? Math.min(5, parseInt(m[1])) : 0; const ci = String($('Chat Trigger').first().json.chatInput || ''); comment = ci.replace(/^\\s*[1-5]\\s*(?:\\/\\s*5)?\\s*[,.:;!)\\-–—]*\\s*/, '').trim().slice(0, 500); }\nconst text = fb ? raw.split('\\n').filter(l => !/^(\\[\\[FEEDBACK\\]\\]|RATING:|COMMENT:)/.test(l.trim())).join('\\n').trim() : rest.join('\\n').trim();\nconst docTitle = title || ('Kế hoạch du lịch ' + new Date().toISOString().slice(0, 10));\nreturn [{json:{output: text, has_itinerary: has, doc_title: docTitle, doc_text: docTitle + '\\n\\n' + text, client_email: clientEmail, has_feedback: fb, budget_blocked: blocked, rating: rating, feedback_text: comment, status: has ? 'AI_PLAN_READY' : (fb ? 'FEEDBACK' : 'AI_CHAT'), version: has ? (parseInt((raw.match(/Версия\\s*(\\d+)/g) || ['0']).slice(-1)[0].replace(/\\D/g,'')) || 1) : ((raw.match(/Версия\\s*(\\d+)/) || [0,0])[1] * 1), crm_status: blocked ? 'OVER_BUDGET' : fb ? 'CLOSED' : has ? 'APPROVED' : (/Подтверждаете/.test(raw) ? 'DRAFT_SENT' : (/смет|бюджет/i.test(raw) && /альтернатив/i.test(raw) ? 'OVER_BUDGET' : 'INTAKE'))}}];"
+      },
+      "id": "d151eb72-4d94-4a3d-baad-6dc5d4f13510",
+      "name": "Build AI reply",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3680,
+        96
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "has-fb",
+              "leftValue": "={{ $json.has_feedback }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "f11e1ae5-7606-481d-8e14-e11b2f031770",
+      "name": "Has feedback?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        4400,
+        160
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "upsert",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "1HyJD1NH9jHtQbSE"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "session_id",
+              "keyValue": "={{ $(\"Chat Trigger\").first().json.sessionId }}"
+            }
+          ]
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "session_id": "={{ $(\"Chat Trigger\").first().json.sessionId }}",
+            "status": "={{ $(\"Build AI reply\").first().json.rating >= 1 && $(\"Build AI reply\").first().json.rating <= 2 ? \"ESCALATED\" : \"CLOSED\" }}",
+            "rating": "={{ $json.rating }}",
+            "feedback": "={{ $json.feedback_text }}",
+            "updated_at": "={{ $now.toISO() }}"
+          }
+        },
+        "options": {}
+      },
+      "id": "0a4338e2-0e05-419a-8a0e-7f33e3ff23c2",
+      "name": "Log feedback",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        4800,
+        -80
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "low-r",
+              "leftValue": "={{ $(\"Build AI reply\").first().json.rating >= 1 && $(\"Build AI reply\").first().json.rating <= 2 }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "b4cd5022-0f76-45d3-b163-6df90329f486",
+      "name": "Low rating?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        4224,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "sendTo": "nguyenhaphuong10122001@gmail.com",
+        "subject": "=Низкая оценка {{ $(\"Build AI reply\").first().json.rating }}/5: сессия {{ $(\"Chat Trigger\").first().json.sessionId }}",
+        "message": "=<p>Клиент поставил оценку {{ $(\"Build AI reply\").first().json.rating }}/5.</p><p>Комментарий: {{ $(\"Build AI reply\").first().json.feedback_text }}</p><p>Сессия: {{ $(\"Chat Trigger\").first().json.sessionId }}. Свяжитесь с клиентом.</p>",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "id": "14229267-bcd9-4a41-84e4-5c4c7897f1d5",
+      "name": "Notify manager",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.2,
+      "position": [
+        4448,
+        0
+      ],
+      "webhookId": "5cd1b337-0837-4827-9006-09051146ec18",
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "1HyJD1NH9jHtQbSE"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "session_id",
+              "keyValue": "={{ $(\"Chat Trigger\").first().json.sessionId }}"
+            }
+          ]
+        },
+        "limit": 1
+      },
+      "id": "98eb072a-1898-4ec8-8c36-89276ff4db33",
+      "name": "Load current status",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        4000,
+        96
+      ],
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const n = $('Build AI reply').first().json;\nconst cur = $input.first().json || {};\nconst rank = {INTAKE:0, OVER_BUDGET:1, DRAFT_SENT:2, APPROVED:3, DOC_SENT:4, CLOSED:5, ESCALATED:6};\nconst curStatus = String(cur.status || '');\nconst keep = !!curStatus && (rank[curStatus] ?? -1) > (rank[n.crm_status] ?? -1);\nreturn [{json:{crm_status: keep ? curStatus : n.crm_status, version: Math.max(Number(cur.version) || 0, Number(n.version) || 0)}}];"
+      },
+      "id": "1e8fbd9e-f946-4da8-8624-5903ae4cafcd",
+      "name": "Keep highest status",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4224,
+        192
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "upsert",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "1HyJD1NH9jHtQbSE"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "session_id",
+              "keyValue": "={{ $(\"Chat Trigger\").first().json.sessionId }}"
+            }
+          ]
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "request_id": "={{ \"REQ-\" + String($(\"Chat Trigger\").first().json.sessionId).slice(-8).toUpperCase() }}",
+            "session_id": "={{ $(\"Chat Trigger\").first().json.sessionId }}",
+            "status": "={{ $json.crm_status }}",
+            "version": "={{ $json.version }}",
+            "client_message": "={{ String($(\"Chat Trigger\").first().json.chatInput || \"\").slice(0, 500) }}",
+            "updated_at": "={{ $now.toISO() }}"
+          }
+        },
+        "options": {}
+      },
+      "id": "67228d9b-971d-4c4d-99e3-b2e62585b627",
+      "name": "Log request status",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        4336,
+        -144
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "has-itin",
+              "leftValue": "={{ $json.has_itinerary }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "17cb8ddf-300e-4d9b-a2c8-974e9ad4a49d",
+      "name": "Has itinerary?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        3776,
+        704
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "createFromText",
+        "content": "={{ $json.doc_text }}",
+        "name": "={{ $json.doc_title }}",
+        "driveId": {
+          "__rl": true,
+          "mode": "list",
+          "value": "My Drive"
+        },
+        "folderId": {
+          "__rl": true,
+          "mode": "list",
+          "value": "root",
+          "cachedResultName": "/ (Root folder)"
+        },
+        "options": {
+          "convertToGoogleDocument": true
+        }
+      },
+      "id": "aca830bd-45d9-4524-b93b-e4573df3638f",
+      "name": "Create itinerary doc",
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [
+        4688,
+        224
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "operation": "share",
+        "fileId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "={{ $(\"Create itinerary doc\").first().json.id }}"
+        },
+        "permissionsUi": {
+          "permissionsValues": {
+            "role": "reader",
+            "type": "anyone"
+          }
+        },
+        "options": {}
+      },
+      "id": "07a79b32-a0ff-4ecf-a420-df9b13ec9c5a",
+      "name": "Share doc with anyone",
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [
+        5360,
+        736
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const p = $('Has itinerary?').first().json;\nconst id = $('Create itinerary doc').first().json.id;\nconst link = 'https://docs.google.com/document/d/' + id + '/edit';\nconst mailNote = p.client_email ? '\\n✉️ Ссылка отправлена на ' + p.client_email : '';\nreturn [{json:{...p, output: p.output + '\\n\\n📄 Lịch trình đã được lưu vào Google Docs: ' + link + mailNote + '\\n\\n⭐ Оцените, пожалуйста, наше обслуживание от 1 до 5 и напишите комментарий — это поможет нам стать лучше.'}}];"
+      },
+      "id": "35472809-47ff-43a5-9e0b-9787a786afa0",
+      "name": "Add doc link to reply",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4672,
+        544
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "has-email",
+              "leftValue": "={{ !!$json.client_email }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "2223dbc9-910e-43b5-8f47-35af3210d579",
+      "name": "Has client email?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        5376,
+        -320
+      ]
+    },
+    {
+      "parameters": {
+        "sendTo": "={{ $(\"Has itinerary?\").first().json.client_email }}",
+        "subject": "={{ $(\"Has itinerary?\").first().json.doc_title }}",
+        "message": "=<p>Здравствуйте,</p><p>Программа вашей поездки готова:</p><p><a href=\"https://docs.google.com/document/d/{{ $(\"Create itinerary doc\").first().json.id }}/edit\">{{ $(\"Has itinerary?\").first().json.doc_title }}</a></p><p>Цены и расписание являются ориентировочными, пожалуйста, уточняйте их у поставщиков.</p>",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "id": "3593c396-139d-4dbd-9b03-0952b7290bc1",
+      "name": "Email itinerary link",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.2,
+      "position": [
+        5936,
+        -32
+      ],
+      "webhookId": "4c3aa18f-5244-48f8-8bb2-a5082b33f99e",
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "operation": "upsert",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "1HyJD1NH9jHtQbSE"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "session_id",
+              "keyValue": "={{ $(\"Chat Trigger\").first().json.sessionId }}"
+            }
+          ]
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "session_id": "={{ $(\"Chat Trigger\").first().json.sessionId }}",
+            "status": "DOC_SENT",
+            "doc_title": "={{ $(\"Has itinerary?\").first().json.doc_title }}",
+            "doc_url": "={{ \"https://docs.google.com/document/d/\" + $(\"Create itinerary doc\").first().json.id + \"/edit\" }}",
+            "updated_at": "={{ $now.toISO() }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "request_id",
+              "displayName": "request_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "session_id",
+              "displayName": "session_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "status",
+              "displayName": "status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "version",
+              "displayName": "version",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "client_message",
+              "displayName": "client_message",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "rating",
+              "displayName": "rating",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "feedback",
+              "displayName": "feedback",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "doc_title",
+              "displayName": "doc_title",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "doc_url",
+              "displayName": "doc_url",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "updated_at",
+              "displayName": "updated_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "215c4a0c-5791-4bf6-997d-e9b1b85d1ca6",
+      "name": "Log doc sent",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        5488,
+        464
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const sid = String($('Chat Trigger').first().json.sessionId || '');\nconst store = $getWorkflowStaticData('global');\nstore.states = store.states || {};\nif ($json.state_blob) { store.states[sid] = $json.state_blob; }\nreturn [{json:{saved:true, state_blob: $json.state_blob, output: $json.output}}];"
+      },
+      "id": "d140142f-e154-4b89-91ed-bb844cc0905c",
+      "name": "Save chat state",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4320,
+        1008
+      ],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "const p = $('Has itinerary?').first().json;\nreturn [{json:{output: p.output + '\\n\\n⚠️ План утверждён, но создать или открыть Google-документ не получилось, поэтому письмо со ссылкой не отправлено. Текст плана — выше. Напишите «подтверждаю» ещё раз, чтобы повторить попытку, или обратитесь к менеджеру.', status:'DOC_ERROR'}}];"
+      },
+      "id": "929e3b16-3d7a-4779-a821-0ecc82f66f34",
+      "name": "Doc error reply",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5328,
+        -48
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "return [{json:{output:$json.output}}];"
+      },
+      "id": "5516ffb4-5caf-4c8b-b8b2-98dee6ac3b2a",
+      "name": "Reply in chat",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4464,
+        -208
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "return [{json:{output:'⚠️ Извините, сейчас не удалось обработать запрос: сервис планирования временно недоступен. Ваши данные сохранены в чате — пожалуйста, повторите сообщение через минуту. Если ошибка повторяется, обратитесь к менеджеру агентства.', status:'AI_ERROR'}}];"
+      },
+      "id": "b3a5b8b4-670d-41d8-952f-a80ae8a7d9d9",
+      "name": "AI error reply",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3936,
+        384
+      ]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Chat Trigger": {
+      "main": [
+        [
+          {
+            "node": "Load chat state",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load chat state": {
+      "main": [
+        [
+          {
+            "node": "Prepare session",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare session": {
+      "main": [
+        [
+          {
+            "node": "Need text extraction?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Need text extraction?": {
+      "main": [
+        [
+          {
+            "node": "AI Travel Planner",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Save chat state",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Travel Planner": {
+      "main": [
+        [
+          {
+            "node": "Build AI reply",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "AI error reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Travel Planner",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Travel chat memory": {
+      "ai_memory": [
+        [
+          {
+            "node": "AI Travel Planner",
+            "type": "ai_memory",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "search_catalog": {
+      "ai_tool": [
+        [
+          {
+            "node": "AI Travel Planner",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "check_feasibility": {
+      "ai_tool": [
+        [
+          {
+            "node": "AI Travel Planner",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "calculate_pricing": {
+      "ai_tool": [
+        [
+          {
+            "node": "AI Travel Planner",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build AI reply": {
+      "main": [
+        [
+          {
+            "node": "Has feedback?",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Has itinerary?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has feedback?": {
+      "main": [
+        [
+          {
+            "node": "Log feedback",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Load current status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log feedback": {
+      "main": [
+        [
+          {
+            "node": "Low rating?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Low rating?": {
+      "main": [
+        [
+          {
+            "node": "Notify manager",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load current status": {
+      "main": [
+        [
+          {
+            "node": "Keep highest status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Keep highest status": {
+      "main": [
+        [
+          {
+            "node": "Log request status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has itinerary?": {
+      "main": [
+        [
+          {
+            "node": "Create itinerary doc",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Save chat state",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create itinerary doc": {
+      "main": [
+        [
+          {
+            "node": "Share doc with anyone",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Doc error reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Share doc with anyone": {
+      "main": [
+        [
+          {
+            "node": "Add doc link to reply",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Doc error reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Add doc link to reply": {
+      "main": [
+        [
+          {
+            "node": "Has client email?",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Log doc sent",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Save chat state",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has client email?": {
+      "main": [
+        [
+          {
+            "node": "Email itinerary link",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save chat state": {
+      "main": [
+        [
+          {
+            "node": "Reply in chat",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Doc error reply": {
+      "main": [
+        [
+          {
+            "node": "Save chat state",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI error reply": {
+      "main": [
+        [
+          {
+            "node": "Reply in chat",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "9ddc6a6a-9ce5-450a-b907-14bcf845f2f0",
+  "meta": {
+    "instanceId": "d0485da1b5aaf39a19223583049d435b343106c18822640dc2c274ef7c630119"
+  },
+  "nodeGroups": [],
+  "id": "1Dmv8ZoTtxqOOVB8",
+  "tags": []
+}
